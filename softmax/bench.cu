@@ -1,7 +1,7 @@
-#include <cuda.h>
-#include <cuda_runtime.h>
-#include <stdio.h>
-#include <stdlib.h>
+#include <nvbench/nvbench.cuh>
+
+#include <thrust/device_vector.h>
+#include <thrust/host_vector.h>
 
 #include "cuda_utils.cuh"
 #include "vectorized_4.cuh"
@@ -21,74 +21,41 @@ float random_normal_clamped(float min, float max) {
     return num;
 }
 
-/*
-Benchmarks a kernel for different sizes
-*/
-void benchmark_kernel_for_sizes(int minN, int maxN) {
-    FILE *exec_time_file = fopen("benchmarks/exec_time_ms_cuda.txt", "w");
+void softmax_vectorized_bench(nvbench::state& state) {
+    const auto N = static_cast<int>(state.get_int64("N"));
+    const int M = 1024;
+    const int matsize = M * N;
 
-    if (exec_time_file == NULL) {
-        perror("Error opening the file for GFLOPS.\n");
+    // Allocate and initialize host data with clamped normal distribution
+    thrust::host_vector<float> h_mat(matsize);
+    for (int i = 0; i < matsize; i++) {
+        h_mat[i] = random_normal_clamped(-10.0f, 10.0f);
     }
 
-    for (int N = minN; N < maxN; N *= 2) {
-        int M = 1024;  // matrix size (M, N)
+    // Transfer to device
+    thrust::device_vector<float> d_mat = h_mat;
+    thrust::device_vector<float> d_res(matsize);
 
-        printf("------------ Running CUDA softmax benchmark for MxN = (%d, %d) -------------\n", M, N);
+    float* matd = thrust::raw_pointer_cast(d_mat.data());
+    float* resd = thrust::raw_pointer_cast(d_res.data());
 
-        int matsize = M * N;
-        int totalsize = matsize * sizeof(float);
+    // Report throughput metrics
+    state.add_element_count(matsize, "Elements");
+    state.add_global_memory_reads<float>(matsize);
+    state.add_global_memory_writes<float>(matsize);
 
-        // allocate and initialize host matrix
-        float *mat = (float *)malloc(totalsize);
-        float *res = (float *)malloc(totalsize);
-        for (int i = 0; i < matsize; i++) {
-            mat[i] = random_normal_clamped(-10, 10);
-        }
+    // Kernel launch parameters (same as run_kernel_4)
+    dim3 block_size(1024);
+    dim3 grid_size(M);
+    int warp_size = 32;
+    size_t smem_size = CEIL_DIV(block_size.x, warp_size) * sizeof(float);
 
-        float *matd, *resd;
-
-        cudaEvent_t start, stop;
-        CUDA_CHECK(cudaEventCreate(&start));
-        CUDA_CHECK(cudaEventCreate(&stop));
-        float ms = 0.0f;
-
-        cudaEventRecord(start);
-        CUDA_CHECK(cudaMalloc(&matd, totalsize));
-        CUDA_CHECK(cudaMalloc(&resd, totalsize));
-        cudaEventRecord(stop);
-        cudaEventSynchronize(stop);
-        cudaEventElapsedTime(&ms, start, stop);
-        printf(">> GPU allocation time: %f ms\n", ms);
-
-        cudaEventRecord(start);
-        CUDA_CHECK(cudaMemcpy(matd, mat, totalsize, cudaMemcpyHostToDevice));
-        cudaEventRecord(stop);
-        cudaEventSynchronize(stop);
-        cudaEventElapsedTime(&ms, start, stop);
-        printf(">> Host to device transfer time: %f ms\n", ms);
-
-        // run softmax kernel
-        ms = run_kernel_4(matd, resd, M, N);
-
-        fprintf(exec_time_file, "%d %f\n", M, ms);
-
-        cudaEventRecord(start);
-        CUDA_CHECK(cudaMemcpy(res, resd, totalsize, cudaMemcpyDeviceToHost));
-        cudaEventRecord(stop);
-        cudaEventSynchronize(stop);
-        cudaEventElapsedTime(&ms, start, stop);
-        printf(">> Device to host transfer time: %f ms\n", ms);
-
-        free(mat);
-        free(res);
-        cudaFree(matd);
-        cudaFree(resd);
-    }
-
-    fclose(exec_time_file);
+    state.exec([&](nvbench::launch& launch) {
+        softmax_kernel_4<<<grid_size, block_size, smem_size, launch.get_stream()>>>(
+            matd, resd, M, N);
+    });
 }
 
-int main() {
-    benchmark_kernel_for_sizes(2048, 262144);
-}
+NVBENCH_BENCH(softmax_vectorized_bench)
+    .add_int64_power_of_two_axis("N", nvbench::range(11, 17, 1))  // 2048 to 131072
+    .set_timeout(1);
