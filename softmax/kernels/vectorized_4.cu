@@ -5,6 +5,12 @@
 
 #include "cuda_utils.cuh"
 
+#define USE_CUB_REDUCE 1
+
+#if USE_CUB_REDUCE
+#include <cub/block/block_reduce.cuh>
+#endif
+
 /*
 This kernel implements an online softmax operation on a matrix of size (M, N).
 The softmax operation is performed on the last dimension of the matrix.
@@ -71,7 +77,17 @@ __global__ void softmax_kernel_4(float* __restrict__ xd, float* __restrict__ res
     // the following for loop reduces the value in all the 8 warps
     // the 8 warps contain the 8 maximum values of the 32 threads that reside in those warps
     // float val = smem[tid];
+    #if USE_CUB_REDUCE
+    {
+        cub::BlockReduce<float, 1024> block_reduce{};
+        float block_max = block_reduce.Reduce(local_max, cuda::maximum<>{});
+        if (threadIdx.x == 0) {
+            smem[0] = block_max;
+        }
+    }
+    #else
     blockReduceMax<float>(local_max, smem, -INFINITY);
+    #endif
     __syncthreads();
 
     // we got the global row max now
@@ -83,7 +99,17 @@ __global__ void softmax_kernel_4(float* __restrict__ xd, float* __restrict__ res
     // same reduction algorithm as above, but instead of max reduction
     // we do a sum reduction i.e. we accumulate the values
     float val = local_norm * expf(local_max - row_max);
+    #if USE_CUB_REDUCE
+    {
+        cub::BlockReduce<float, 1024> block_reduce{};
+        float block_sum = block_reduce.Reduce(val, cuda::std::plus<>{});
+        if (threadIdx.x == 0) {
+            smem[0] = block_sum;
+        }
+    }
+    #else
     blockReduceSum<float>(val, smem, 0.0f);
+    #endif
     __syncthreads();
 
     float row_norm = smem[0];
